@@ -9,7 +9,7 @@ from torch.distributions import Categorical
 OBSERVATION_DIM = 4
 ACTION_DIM = 2
 
-NUM_ENVS = 64
+NUM_ENVS = 32
 TRAJECTORY_WINDOW = 500
 
 CLIP = 0.2
@@ -20,6 +20,8 @@ MB_SIZE = 256
 
 GAMMA = 0.99
 LAMBDA = 0.95
+
+NUM_EPISODES = 25
 
 ### Model
 class ActorCritic(nn.Module):
@@ -54,95 +56,97 @@ acmodule = ActorCritic(OBSERVATION_DIM, ACTION_DIM, 128)
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(acmodule.parameters(), lr=3e-4)
 
-obs, info = vecenv.reset()
+for episode in range(NUM_EPISODES):
+    print(f"StartingEpisode {episode+1}/{NUM_EPISODES}")
+    obs, info = vecenv.reset()
 
-obs_buf      = torch.zeros(TRAJECTORY_WINDOW, NUM_ENVS, OBSERVATION_DIM)
-act_buf      = torch.zeros(TRAJECTORY_WINDOW, NUM_ENVS, dtype=torch.long)
-rew_buf      = torch.zeros(TRAJECTORY_WINDOW, NUM_ENVS)
-done_buf     = torch.zeros(TRAJECTORY_WINDOW, NUM_ENVS)
-logp_buf     = torch.zeros(TRAJECTORY_WINDOW, NUM_ENVS)
-val_buf      = torch.zeros(TRAJECTORY_WINDOW, NUM_ENVS)
+    obs_buf      = torch.zeros(TRAJECTORY_WINDOW, NUM_ENVS, OBSERVATION_DIM)
+    act_buf      = torch.zeros(TRAJECTORY_WINDOW, NUM_ENVS, dtype=torch.long)
+    rew_buf      = torch.zeros(TRAJECTORY_WINDOW, NUM_ENVS)
+    done_buf     = torch.zeros(TRAJECTORY_WINDOW, NUM_ENVS)
+    logp_buf     = torch.zeros(TRAJECTORY_WINDOW, NUM_ENVS)
+    val_buf      = torch.zeros(TRAJECTORY_WINDOW, NUM_ENVS)
 
-obs_np, _ = vecenv.reset()
-obs = torch.from_numpy(obs_np).float()
+    obs_np, _ = vecenv.reset()
+    obs = torch.from_numpy(obs_np).float()
 
-for t in range(TRAJECTORY_WINDOW):
-    obs_buf[t] = obs
+    for t in range(TRAJECTORY_WINDOW):
+        obs_buf[t] = obs
+
+        with torch.no_grad():
+            logits = acmodule.target_actor(obs) # N, act_dim
+            values = acmodule.critic(obs).squeeze(-1) # N
+            dist = Categorical(logits=logits)
+
+            actions = dist.sample() # N
+            logp = dist.log_prob(actions) # N
+
+        act_buf[t] = actions
+        logp_buf[t] = logp
+        val_buf[t] = values
+        
+        next_obs_np, rewards, terminations, truncations, infos = vecenv.step(actions.numpy())
+        dones = np.logical_or(terminations, truncations)
+
+        rew_buf[t] = torch.tensor(rewards, dtype=torch.float32)
+        done_buf[t] = torch.tensor(dones.astype(np.float32))
+
+        obs = torch.tensor(next_obs_np, dtype=torch.float32)
 
     with torch.no_grad():
-        logits = acmodule.target_actor(obs) # N, act_dim
-        values = acmodule.critic(obs).squeeze(-1) # N
-        dist = Categorical(logits=logits)
+        last_values = acmodule.critic(obs).squeeze(-1) # ZN
+    adv_buf = torch.zeros_like(rew_buf)
+    ret_buf = torch.zeros_like(rew_buf)
 
-        actions = dist.sample() # N
-        logp = dist.log_prob(actions) # N
+    gae = torch.zeros(NUM_ENVS)
+    for t in reversed(range(TRAJECTORY_WINDOW)):
+        nonterminal = 1.0 - done_buf[t]
+        next_values  = last_values if t == TRAJECTORY_WINDOW - 1 else val_buf[t+1]
+        delta = rew_buf[t] + GAMMA * next_values * nonterminal - val_buf[t]
+        gae = delta + GAMMA * LAMBDA * nonterminal * gae
+        adv_buf[t] = gae
+        ret_buf[t] = adv_buf[t] + val_buf[t]
 
-    act_buf[t] = actions
-    logp_buf[t] = logp
-    val_buf[t] = values
-    
-    next_obs_np, rewards, terminations, truncations, infos = vecenv.step(actions.numpy())
-    dones = np.logical_or(terminations, truncations)
+    adv_flat = adv_buf.reshape(-1)
+    adv_buf = (adv_buf - adv_flat.mean()) / (adv_flat.std() + 1e-8)
 
-    rew_buf[t] = torch.tensor(rewards, dtype=torch.float32)
-    done_buf[t] = torch.tensor(dones.astype(np.float32))
+    B = TRAJECTORY_WINDOW * NUM_ENVS
+    obs_flat  = obs_buf.reshape(B, OBSERVATION_DIM)
+    act_flat  = act_buf.reshape(B)
+    logp_old  = logp_buf.reshape(B)
+    adv_flat  = adv_buf.reshape(B)
+    ret_flat  = ret_buf.reshape(B)
+    val_old   = val_buf.reshape(B)
 
-    obs = torch.tensor(next_obs_np, dtype=torch.float32)
+    idxs = torch.arange(B)
 
-with torch.no_grad():
-    last_values = acmodule.critic(obs).squeeze(-1) # ZN
-adv_buf = torch.zeros_like(rew_buf)
-ret_buf = torch.zeros_like(rew_buf)
+    for _ in range(EPOCHS):
+        perm = idxs[torch.randperm(B)]
+        for start in range(0, B, MB_SIZE):
+            mb = perm[start:start+MB_SIZE]
 
-gae = torch.zeros(NUM_ENVS)
-for t in reversed(range(TRAJECTORY_WINDOW)):
-    nonterminal = 1.0 - done_buf[t]
-    next_values  = last_values if t == TRAJECTORY_WINDOW - 1 else val_buf[t+1]
-    delta = rew_buf[t] + GAMMA * next_values * nonterminal - val_buf[t]
-    gae = delta + GAMMA * LAMBDA * nonterminal * gae
-    adv_buf[t] = gae
-    ret_buf[t] = adv_buf[t] + val_buf[t]
+            logits = acmodule.target_actor(obs_flat[mb])
+            values = acmodule.critic(obs_flat[mb]).squeeze(-1)
+            dist = Categorical(logits=logits)
 
-adv_flat = adv_buf.reshape(-1)
-adv_buf = (adv_buf - adv_flat.mean()) / (adv_flat.std() + 1e-8)
+            # new probabilities
+            logp = dist.log_prob(act_flat[mb])
+            entropy = dist.entropy().mean()
 
-B = TRAJECTORY_WINDOW * NUM_ENVS
-obs_flat  = obs_buf.reshape(B, OBSERVATION_DIM)
-act_flat  = act_buf.reshape(B)
-logp_old  = logp_buf.reshape(B)
-adv_flat  = adv_buf.reshape(B)
-ret_flat  = ret_buf.reshape(B)
-val_old   = val_buf.reshape(B)
+            # update the critic network
+            critic_loss = criterion(values, ret_flat[mb])
 
-idxs = torch.arange(B)
+            # update the actor network
+            ratio = torch.exp(logp - logp_old[mb])
+            surrogate_left = ratio * adv_flat[mb] # size: MB
+            surrogate_right = torch.clamp(ratio, 1.0 - CLIP, 1.0 + CLIP) * adv_flat[mb]
 
-for _ in range(EPOCHS):
-    perm = idxs[torch.randperm(B)]
-    for start in range(0, B, MB_SIZE):
-        mb = perm[start:start+MB_SIZE]
+            actor_loss = -torch.min(surrogate_left, surrogate_right).mean()
+            loss = actor_loss + VF_COEF * critic_loss - ENT_COEF * entropy
 
-        logits = acmodule.target_actor(obs_flat[mb])
-        values = acmodule.critic(obs_flat[mb]).squeeze(-1)
-        dist = Categorical(logits=logits)
-
-        # new probabilities
-        logp = dist.log_prob(act_flat[mb])
-        entropy = dist.entropy().mean()
-
-        # update the critic network
-        critic_loss = criterion(values, ret_flat[mb])
-
-        # update the actor network
-        ratio = torch.exp(logp - logp_old[mb])
-        surrogate_left = ratio * adv_flat[mb] # size: MB
-        surrogate_right = torch.clamp(ratio, 1.0 - CLIP, 1.0 + CLIP) * adv_flat[mb]
-
-        actor_loss = -torch.min(surrogate_left, surrogate_right).mean()
-        loss = actor_loss + VF_COEF * critic_loss - ENT_COEF * entropy
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
 print("\nRunning evaluation episode with video...")
 eval_env = gym.make("CartPole-v1", render_mode="rgb_array")
